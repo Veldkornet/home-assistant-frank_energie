@@ -254,3 +254,7 @@ def create_mock_charger(create_mock_charge_settings):
         return charger
 
     return _create
+
+@pytest.fixture(autouse=True)
+def setup_core_uuid(hass):
+    hass.data["core.uuid"] = "mock_uuid"
