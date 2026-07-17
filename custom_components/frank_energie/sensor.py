@@ -4601,10 +4601,18 @@ class FrankEnergieSensor(
             self._unsub_update = None
 
         # Schedule the next update at exactly the next whole hour sharp or every quarter hour
-        # TODO: Use hour updates when prices are available hourly only
         now = dt_util.now(ZoneInfo("UTC"))
         minute = now.minute
-        if minute >= 45:
+
+        # Use hour updates when prices are available hourly only
+        resolution = getattr(self.coordinator, "resolution", "PT15M")
+
+        if resolution == "PT60M":
+            # Hourly resolution
+            next_update_time = now.replace(
+                minute=0, second=0, microsecond=0
+            ) + timedelta(hours=1)
+        elif minute >= 45:
             # Next whole hour
             next_update_time = now.replace(
                 minute=0, second=0, microsecond=0
