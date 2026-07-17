@@ -96,7 +96,6 @@ from .const import (
     TIMEZONE_AMSTERDAM,
     UNIT_ELECTRICITY,
     UNIT_GAS,
-    UNIT_GAS_NL,
     VERSION,
 )
 from .coordinator import (
