@@ -113,24 +113,6 @@ _LOGGER = logging.getLogger(__name__)
 FORMAT_DATE = "%d-%m-%Y"
 
 
-def _get_gas_unit(per_unit: str | None) -> str:
-    """Return the Home Assistant gas unit for an API perUnit value."""
-
-    if per_unit is None:
-        return UNIT_GAS_NL
-
-    unit = PER_UNIT_TO_UNIT.get(per_unit.upper())
-
-    if unit is None:
-        _LOGGER.warning(
-            "Unsupported gas perUnit value received from API: %s",
-            per_unit,
-        )
-        return UNIT_GAS_NL
-
-    return unit
-
-
 def _format_battery_date(date_val) -> datetime | None:
     """Parse a battery session date value (str or date) into a timezone-aware datetime.
 
