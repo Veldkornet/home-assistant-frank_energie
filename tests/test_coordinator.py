@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 from custom_components.frank_energie.const import (
     DATA_ELECTRICITY,
@@ -1281,13 +1282,25 @@ async def test_full_day_cycle_fetch_promote_refetch(
             result[DATA_ELECTRICITY].all[-1].date_from.astimezone(tz).date()
             == tomorrow
         )
-        fetch_calls_after_first = coordinator._fetch_tomorrow_data.call_count
+        tomorrow_fetch_calls_after_first = coordinator._fetch_tomorrow_data.call_count
+        today_fetch_calls_after_first = coordinator._fetch_prices_with_fallback.call_count
 
         # --- {today}, 13:05 local: next in-window tick must be a pure no-op ---
         freezer.move_to(datetime(today.year, today.month, today.day, 13, 5, tzinfo=tz))
         await coordinator._async_update_data()
 
-        assert coordinator._fetch_tomorrow_data.call_count == fetch_calls_after_first
+        assert (
+            coordinator._fetch_tomorrow_data.call_count
+            == tomorrow_fetch_calls_after_first
+        )
+        # Today's fetch must also skip re-fetching once already done today —
+        # the live _async_update_data has its own separate freshness check
+        # for this (last_fetch_today.date() == today), distinct from
+        # _refresh_tomorrow_cache's.
+        assert (
+            coordinator._fetch_prices_with_fallback.call_count
+            == today_fetch_calls_after_first
+        )
         assert coordinator.update_interval is None  # now confirmed idle
 
         # --- Midnight {today} -> {tomorrow}: promote tomorrow's cache ---
@@ -1303,6 +1316,99 @@ async def test_full_day_cycle_fetch_promote_refetch(
         # promote_tomorrow_prices deliberately never touches last_fetch_tomorrow —
         # it's still stale for the new today until the next _async_update_data run.
         assert coordinator.last_fetch_tomorrow == now_utc_first
+
+
+@pytest.mark.asyncio
+async def test_async_update_data_falls_back_to_cached_today_on_fetch_failure(
+    mock_frank_energie, mock_config_entry, freezer
+) -> None:
+    """A failed today-fetch must fall back to cached data instead of failing the update.
+
+    Coverage gap left by removing the dead _fetch_today_data/_get_static_data
+    path: FrankEnergiePriceCoordinator's real _async_update_data has its own,
+    different fallback-on-exception logic for today's fetch (checking
+    electricity/gas .current instead of a date-range check), which had no
+    test coverage of its own — the old tests exercised the dead method's
+    version of this behavior, not the live one.
+    """
+    tz = ZoneInfo(TIMEZONE_AMSTERDAM)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    settings_coordinator.data = {}
+
+    coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+    coordinator._fetch_contract_price_resolution_state = AsyncMock(return_value=None)
+    coordinator.store.async_save = AsyncMock()
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=None)
+
+    freezer.move_to(datetime(2026, 7, 20, 13, 0, tzinfo=tz))
+
+    # Valid cached "today" data whose current entry covers this exact moment —
+    # the fallback check requires both electricity AND gas to have a .current
+    # entry, so (unlike _make_market_prices' always-empty gas) both need data.
+    from python_frank_energie.models import MarketPrices, PriceData
+
+    cached_today = MarketPrices(
+        electricity=_make_market_prices("2026-07-20T11:00:00.000Z").electricity,
+        gas=PriceData(
+            [
+                {
+                    "from": "2026-07-20T11:00:00.000Z",
+                    "till": "2026-07-20T11:15:00.000Z",
+                    "marketPrice": 0.5,
+                    "marketPriceTax": 0.1,
+                    "sourcingMarkupPrice": 0.05,
+                    "energyTaxPrice": 0.3,
+                }
+            ],
+            energy_type="gas",
+        ),
+        energy_country="NL",
+    )
+    coordinator._static_prices_today = cached_today
+
+    coordinator._fetch_prices_with_fallback = AsyncMock(
+        side_effect=RequestException("simulated network error")
+    )
+
+    result = await coordinator._async_update_data()
+
+    assert result[DATA_ELECTRICITY] is cached_today.electricity
+    assert coordinator.last_fetch_today is None  # fallback path never updates it
+
+
+@pytest.mark.asyncio
+async def test_async_update_data_raises_when_fetch_fails_and_no_valid_cache(
+    mock_frank_energie, mock_config_entry, freezer
+) -> None:
+    """A failed today-fetch with nothing valid to fall back to must raise UpdateFailed."""
+    tz = ZoneInfo(TIMEZONE_AMSTERDAM)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    settings_coordinator.data = {}
+
+    coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+    coordinator._fetch_contract_price_resolution_state = AsyncMock(return_value=None)
+    coordinator.store.async_save = AsyncMock()
+
+    freezer.move_to(datetime(2026, 7, 20, 13, 0, tzinfo=tz))
+
+    assert coordinator._static_prices_today is None  # nothing cached yet
+
+    coordinator._fetch_prices_with_fallback = AsyncMock(
+        side_effect=RequestException("simulated network error")
+    )
+
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
 
 
 @pytest.mark.asyncio
