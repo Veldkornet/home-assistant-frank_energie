@@ -120,6 +120,59 @@ async def test_unload_entry(
     assert entry.entry_id not in hass.data[DOMAIN]
 
 
+async def test_remove_entry_deletes_price_cache_store(
+    hass: HomeAssistant,
+    aioclient_responses: ResponseMocks,
+    freezer,
+    enable_custom_integrations,
+) -> None:
+    """Removing a config entry must delete its persisted price cache file.
+
+    Regression test: only async_unload_entry existed, which HA calls on
+    reload/disable, not on full removal. Without async_remove_entry, the
+    per-entry Store file under .storage/ was never cleaned up, so
+    add-then-delete-then-readd (e.g. testing with a throwaway unauthenticated
+    entry) left orphaned cache files behind indefinitely.
+    """
+    await hass.config.async_set_time_zone("Europe/Amsterdam")
+    tz = zoneinfo.ZoneInfo("Europe/Amsterdam")
+    now = datetime.now(tz).replace(hour=10, minute=15, second=0, microsecond=0)
+    freezer.move_to(now)
+
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    aioclient_responses.add(
+        start_of_day,
+        [0.2] * 24,
+        [1.23] * 24,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "username": "test@example.com",
+        },
+        entry_id="1234abcd",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert result is True
+
+    with patch(
+        "custom_components.frank_energie.Store", autospec=True
+    ) as mock_store_cls:
+        mock_store = mock_store_cls.return_value
+        mock_store.async_remove = AsyncMock()
+
+        remove_result = await hass.config_entries.async_remove(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert remove_result["require_restart"] is False
+        mock_store_cls.assert_called_once_with(hass, 1, f"{DOMAIN}_prices_{entry.entry_id}")
+        mock_store.async_remove.assert_awaited_once()
+
+
 async def test_encryption_decryption(hass: HomeAssistant) -> None:
     """Test encrypting and decrypting passwords."""
     from custom_components.frank_energie.helpers import (

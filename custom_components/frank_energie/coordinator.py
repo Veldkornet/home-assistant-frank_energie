@@ -812,6 +812,10 @@ class FrankEnergieCoordinator(DataUpdateCoordinator[FrankEnergieData]):
                 )
                 return self.cached_prices_tomorrow
 
+            # A live fetch now validates itself before caching (see the
+            # freshly-fetched check below), so reaching this branch means the
+            # bad data came from disk — e.g. state persisted by an older
+            # build. Kept at warning: that's a genuine anomaly, not routine.
             _LOGGER.warning(
                 "Cached tomorrow prices claim to be fetched today but are not "
                 "actually dated for %s — discarding stale/incorrect cache and "
@@ -848,6 +852,30 @@ class FrankEnergieCoordinator(DataUpdateCoordinator[FrankEnergieData]):
             has_electricity,
             has_gas,
         )
+
+        if (has_electricity or has_gas) and not self._tomorrow_cache_matches_date(
+            prices_tomorrow, tomorrow
+        ):
+            # Same poisoning this method's self-heal check guards against, but
+            # caught immediately instead of one cycle later: a freshly fetched
+            # response can itself come back non-empty but dated for today
+            # instead of tomorrow (e.g. the API echoing the latest available
+            # day back for a not-yet-published date — routinely the case in
+            # the few minutes right around 13:00, since prices are typically
+            # published closer to 13:15-13:20 than exactly on the hour).
+            # Accepting it here would cache it as a genuine fetch and (via
+            # _adjust_update_interval) go idle for the rest of the day,
+            # silently repeating the exact same poisoning next time with no
+            # further warning. Logged at debug, not warning: this is the
+            # expected shape of "not published yet", not an anomaly.
+            _LOGGER.debug(
+                "Freshly fetched tomorrow prices are not actually dated for "
+                "%s — treating as not yet available and retrying on next "
+                "refresh",
+                tomorrow,
+            )
+            prices_tomorrow = None
+            has_electricity = has_gas = False
 
         if has_electricity or has_gas:
             _LOGGER.info(
@@ -2941,11 +2969,18 @@ class FrankEnergiePriceCoordinator(FrankEnergieCoordinator):
     def _adjust_update_interval(self, now_utc: datetime) -> None:
         """Adjust coordinator update interval based on publication window and cache status."""
         today = now_utc.astimezone(ZoneInfo(TIMEZONE_AMSTERDAM)).date()
+        tomorrow = today + timedelta(days=1)
         if (
             self.cached_prices_tomorrow is not None
             and self.last_fetch_tomorrow is not None
             and self.last_fetch_tomorrow.date() == today
+            and self._tomorrow_cache_matches_date(self.cached_prices_tomorrow, tomorrow)
         ):
+            # Only go idle once the cache is verified to actually be tomorrow's
+            # data — trusting last_fetch_tomorrow's date alone would let a
+            # poisoned cache (see _refresh_tomorrow_cache) silence automatic
+            # polling for the rest of the day, since nothing else would ever
+            # re-trigger the fetch that re-validates it.
             new_interval = None
         else:
             now_local = now_utc.astimezone(ZoneInfo(TIMEZONE_AMSTERDAM))

@@ -2,12 +2,14 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from homeassistant.util import dt as dt_util
 from custom_components.frank_energie.const import (
     DATA_ELECTRICITY,
     DATA_GAS,
     DATA_INVOICES,
     DATA_MONTH_SUMMARY,
     DATA_USER,
+    TIMEZONE_AMSTERDAM,
 )
 from custom_components.frank_energie.exceptions import NoSuitableSitesFoundError
 from custom_components.frank_energie.coordinator import (
@@ -1470,14 +1472,49 @@ async def test_price_coordinator_skipped_when_cached(
         MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
     )
 
-    # Mock cached tomorrow prices as available and fetched today
-    tomorrow_prices = MagicMock()
+    # Mock cached tomorrow prices as available, genuinely dated tomorrow, and
+    # fetched today.
+    tomorrow_prices = _make_market_prices("2026-05-27T22:00:00.000Z")
     price_coordinator.cached_prices_tomorrow = tomorrow_prices
     price_coordinator.last_fetch_tomorrow = mock_now
 
     price_coordinator._adjust_update_interval(mock_now)
 
     assert price_coordinator.update_interval is None
+
+
+@pytest.mark.asyncio
+async def test_price_coordinator_not_skipped_when_cache_poisoned(
+    mock_frank_energie, mock_config_entry, monkeypatch
+) -> None:
+    """A same-day cache that isn't actually dated tomorrow must not silence polling.
+
+    Regression test: trusting last_fetch_tomorrow's date alone let a poisoned
+    cache set update_interval to None, which meant nothing would ever
+    automatically re-trigger _async_update_data (and therefore the
+    _refresh_tomorrow_cache self-heal check) again for the rest of the day.
+    """
+    # Mock utcnow to 12:00 UTC (14:00 local time CEST on May 27th)
+    mock_now = datetime(2026, 5, 27, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+    from homeassistant.util import dt as dt_util
+
+    monkeypatch.setattr(dt_util, "utcnow", lambda: mock_now)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    price_coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+
+    # Poisoned: claims to be fetched today, but entries are dated today too.
+    poisoned_prices = _make_market_prices("2026-05-27T10:00:00.000Z")
+    price_coordinator.cached_prices_tomorrow = poisoned_prices
+    price_coordinator.last_fetch_tomorrow = mock_now
+
+    price_coordinator._adjust_update_interval(mock_now)
+
+    assert price_coordinator.update_interval == timedelta(minutes=5)
 
 
 @pytest.mark.asyncio
@@ -1558,6 +1595,85 @@ async def test_price_coordinator_midnight_rollover_resolution_mismatch(
         is tomorrow_prices.electricity
     )
     assert price_coordinator._static_prices_today.gas is tomorrow_prices.gas
+
+
+@pytest.mark.asyncio
+async def test_full_day_cycle_fetch_promote_refetch(
+    mock_frank_energie, mock_config_entry, freezer
+) -> None:
+    """Simulate a full day/night cycle end-to-end, not just isolated unit steps.
+
+    Day 1, 13:00: fetch tomorrow's (Day 2) prices via _refresh_tomorrow_cache.
+    Midnight Day 1 -> Day 2: promote_tomorrow_prices() hands that cache over
+    to become "today".
+    Day 2, 13:00: _refresh_tomorrow_cache runs again to fetch Day 3.
+
+    This ties together three things that only interact across the day
+    boundary: the freshly-fetched-data validation in _refresh_tomorrow_cache,
+    the fact that promote_tomorrow_prices deliberately does not touch
+    last_fetch_tomorrow, and _refresh_tomorrow_cache's separate
+    last_fetch_tomorrow.date() != today staleness check that has to clean
+    that up again the next day. Each has its own unit test, but nothing
+    previously exercised them chained together with real dated data.
+    """
+    from datetime import date
+
+    tz = ZoneInfo(TIMEZONE_AMSTERDAM)
+    day1, day2, day3 = date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+
+    # --- Day 1, 13:00 local: fetch tomorrow's (Day 2) prices ---
+    freezer.move_to(datetime(2026, 7, 20, 13, 0, tzinfo=tz))
+    now_utc_1 = dt_util.utcnow()
+
+    day1_today_prices = _make_market_prices("2026-07-20T10:00:00.000Z")
+    coordinator._static_prices_today = day1_today_prices
+    coordinator.cached_prices = {
+        DATA_ELECTRICITY: day1_today_prices.electricity,
+        DATA_GAS: day1_today_prices.gas,
+    }
+
+    day2_prices = _make_market_prices("2026-07-20T22:00:00.000Z")  # Day 2, 00:00 local
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day2_prices)
+
+    result_1300_day1 = await coordinator._refresh_tomorrow_cache(day1, day2, now_utc_1)
+
+    assert result_1300_day1 is day2_prices
+    assert coordinator.cached_prices_tomorrow is day2_prices
+    assert coordinator.last_fetch_tomorrow == now_utc_1
+
+    # --- Midnight Day 1 -> Day 2: promote tomorrow's cache to today ---
+    freezer.move_to(datetime(2026, 7, 21, 0, 0, tzinfo=tz))
+    coordinator.promote_tomorrow_prices()
+
+    # Day 2's prices are now "today"; nothing was ever fetched for Day 3 yet,
+    # so the tomorrow cache is empty rather than carrying leftover data.
+    assert coordinator.cached_prices_tomorrow is None
+    assert coordinator._static_prices_today.electricity.all[-1].date_from.astimezone(
+        tz
+    ).date() == day2
+    # promote_tomorrow_prices deliberately never touches last_fetch_tomorrow —
+    # it's still Day 1's fetch timestamp, now stale for Day 2.
+    assert coordinator.last_fetch_tomorrow == now_utc_1
+
+    # --- Day 2, 13:00 local: fetch tomorrow's (Day 3) prices ---
+    freezer.move_to(datetime(2026, 7, 21, 13, 0, tzinfo=tz))
+    now_utc_2 = dt_util.utcnow()
+
+    day3_prices = _make_market_prices("2026-07-21T22:00:00.000Z")  # Day 3, 00:00 local
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day3_prices)
+
+    result_1300_day2 = await coordinator._refresh_tomorrow_cache(day2, day3, now_utc_2)
+
+    assert result_1300_day2 is day3_prices
+    assert coordinator.cached_prices_tomorrow is day3_prices
+    assert coordinator.last_fetch_tomorrow == now_utc_2
 
 
 @pytest.mark.asyncio
@@ -2048,6 +2164,40 @@ async def test_refresh_tomorrow_cache_accepts_legitimate_multi_day_window(
 
     coordinator._fetch_tomorrow_data.assert_not_called()
     assert result is multi_day_prices
+
+
+@pytest.mark.asyncio
+async def test_refresh_tomorrow_cache_rejects_freshly_fetched_poisoned_data(
+    coordinator: FrankEnergieCoordinator,
+) -> None:
+    """A freshly fetched response dated for today, not tomorrow, must not be cached.
+
+    Regression test: the self-heal check only re-validated an *existing*
+    same-day cache one cycle later. It never validated the response of the
+    fetch it triggered to fix that cache, so a fetch that itself came back
+    non-empty but still dated for today (e.g. the API echoing the latest
+    available day back for a not-yet-published date) got cached as a
+    genuine success — silently re-poisoning the cache with no further
+    warning, and (via _adjust_update_interval) going idle for the rest of
+    the day.
+    """
+    from datetime import date
+
+    today = date(2026, 7, 20)
+    tomorrow = date(2026, 7, 21)
+    now_utc = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+    coordinator.cached_prices_tomorrow = None
+    coordinator.last_fetch_tomorrow = None
+
+    poisoned_fetch_result = _make_market_prices("2026-07-20T10:00:00.000Z")
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=poisoned_fetch_result)
+
+    result = await coordinator._refresh_tomorrow_cache(today, tomorrow, now_utc)
+
+    assert result is None
+    assert coordinator.cached_prices_tomorrow is None
+    assert coordinator.last_fetch_tomorrow is None
 
 
 @pytest.mark.asyncio
