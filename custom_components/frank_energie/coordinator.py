@@ -788,11 +788,12 @@ class FrankEnergieCoordinator(DataUpdateCoordinator[FrankEnergieData]):
         # cached_prices_tomorrow still holds yesterday's D+1 data, which
         # _aggregate_data would concatenate with today's prices — doubling
         # price periods on sensors between 11:00 and ~14:00 UTC every morning.
-        if (
-            self.cached_prices_tomorrow is not None
-            and self.last_fetch_tomorrow is not None
-            and self.last_fetch_tomorrow.date() != today
-        ):
+        # Not gated on cached_prices_tomorrow being set: promotion can leave
+        # last_fetch_tomorrow behind on its own (e.g. cleared to None because
+        # there was nothing left to carry over), and a stale timestamp with
+        # no cache to match it is exactly the kind of inconsistent state this
+        # method exists to clean up before trusting anything.
+        if self.last_fetch_tomorrow is not None and self.last_fetch_tomorrow.date() != today:
             _LOGGER.debug(
                 "Invalidating stale tomorrow-price cache (was fetched on %s)",
                 self.last_fetch_tomorrow.date(),
@@ -2005,6 +2006,28 @@ class FrankEnergieCoordinator(DataUpdateCoordinator[FrankEnergieData]):
             )
             return
 
+        new_today = dt_util.now(ZoneInfo(TIMEZONE_AMSTERDAM)).date()
+
+        # Everything else in this file re-validates cached_prices_tomorrow
+        # against the date it's meant to represent before trusting it (see
+        # _refresh_tomorrow_cache and _adjust_update_interval); promotion is
+        # the one remaining place that didn't. It normally can't reach here
+        # holding stale data — _refresh_tomorrow_cache clears anything not
+        # fetched today before every 13:00+ run — but if a day is ever
+        # skipped entirely (HA down across a whole day), or a future bug
+        # reintroduces unvalidated writes, this stops days-old prices from
+        # getting merged straight into "today" with no warning.
+        if not self._tomorrow_cache_matches_date(prices_tomorrow, new_today):
+            _LOGGER.warning(
+                "Midnight rollover: cached tomorrow prices are not actually "
+                "dated for %s — discarding instead of promoting, today's "
+                "prices will be refetched live",
+                new_today,
+            )
+            self.cached_prices_tomorrow = None
+            self.last_fetch_tomorrow = None
+            return
+
         source_data = self.cached_prices or self.data
         if source_data is None:
             _LOGGER.warning("Cannot promote tomorrow prices: no cached data available")
@@ -2062,7 +2085,6 @@ class FrankEnergieCoordinator(DataUpdateCoordinator[FrankEnergieData]):
 
         # Prices dated after the new today are still tomorrow's prices:
         # promote them to the tomorrow cache instead of clearing it.
-        new_today = dt_util.now(ZoneInfo(TIMEZONE_AMSTERDAM)).date()
         remaining_electricity = self._price_data_after(combined_electricity, new_today)
         remaining_gas = self._price_data_after(combined_gas, new_today)
 

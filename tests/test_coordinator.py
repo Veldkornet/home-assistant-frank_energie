@@ -1598,6 +1598,50 @@ async def test_price_coordinator_midnight_rollover_resolution_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_promote_tomorrow_prices_rejects_stale_multi_day_old_cache(
+    mock_frank_energie, mock_config_entry, freezer
+) -> None:
+    """Promotion must not merge a tomorrow-cache that isn't dated for the new today.
+
+    Regression test: unlike _refresh_tomorrow_cache and _adjust_update_interval,
+    promote_tomorrow_prices trusted cached_prices_tomorrow unconditionally. In
+    normal operation _refresh_tomorrow_cache always clears anything not
+    fetched today before every 13:00+ run, so this couldn't happen — but if a
+    whole day is ever skipped (HA down across it) days-old prices would
+    otherwise get merged straight into "today" with no validation at all.
+    """
+    tz = ZoneInfo(TIMEZONE_AMSTERDAM)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+
+    existing_today = _make_market_prices("2026-07-19T10:00:00.000Z")
+    coordinator._static_prices_today = existing_today
+    coordinator.cached_prices = {
+        DATA_ELECTRICITY: existing_today.electricity,
+        DATA_GAS: existing_today.gas,
+    }
+
+    # Three days stale: last genuinely fetched for 2026-07-20, but midnight
+    # rollover is now happening for 2026-07-23 (e.g. HA was down in between).
+    stale_prices = _make_market_prices("2026-07-19T22:00:00.000Z")
+    coordinator.cached_prices_tomorrow = stale_prices
+    coordinator.last_fetch_tomorrow = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+
+    freezer.move_to(datetime(2026, 7, 23, 0, 0, tzinfo=tz))
+    coordinator.promote_tomorrow_prices()
+
+    assert coordinator.cached_prices_tomorrow is None
+    assert coordinator.last_fetch_tomorrow is None
+    # Today's prices must be untouched, not poisoned with the stale merge.
+    assert coordinator._static_prices_today is existing_today
+
+
+@pytest.mark.asyncio
 async def test_full_day_cycle_fetch_promote_refetch(
     mock_frank_energie, mock_config_entry, freezer
 ) -> None:
@@ -1674,6 +1718,93 @@ async def test_full_day_cycle_fetch_promote_refetch(
     assert result_1300_day2 is day3_prices
     assert coordinator.cached_prices_tomorrow is day3_prices
     assert coordinator.last_fetch_tomorrow == now_utc_2
+
+
+@pytest.mark.asyncio
+async def test_full_day_cycle_recovers_when_first_attempt_is_poisoned(
+    mock_frank_energie, mock_config_entry, freezer
+) -> None:
+    """A day whose first 13:00 attempt is poisoned must still self-heal via retry.
+
+    Reported in the wild: the fix worked for one day, then failed the next.
+    This simulates the shape of that report directly — Day 2's first fetch
+    attempt at 13:00 comes back non-empty but dated for today instead of
+    tomorrow (the API echo case), and only the retry a few minutes later
+    (as _adjust_update_interval's 5-minute in-window polling would trigger)
+    actually gets tomorrow's real data. Confirms two things stay true across
+    a poisoned attempt: the coordinator does not go idle after it (so the
+    retry can happen automatically), and the retry itself succeeds cleanly.
+    """
+    from datetime import date
+
+    tz = ZoneInfo(TIMEZONE_AMSTERDAM)
+    day1, day2, day3 = date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22)
+
+    settings_coordinator = FrankEnergieSettingsCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie
+    )
+    coordinator = FrankEnergiePriceCoordinator(
+        MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
+    )
+
+    # --- Day 1, 13:00: fetch succeeds cleanly, same as the happy path ---
+    freezer.move_to(datetime(2026, 7, 20, 13, 0, tzinfo=tz))
+    now_utc_1 = dt_util.utcnow()
+
+    day1_today_prices = _make_market_prices("2026-07-20T10:00:00.000Z")
+    coordinator._static_prices_today = day1_today_prices
+    coordinator.cached_prices = {
+        DATA_ELECTRICITY: day1_today_prices.electricity,
+        DATA_GAS: day1_today_prices.gas,
+    }
+
+    day2_prices = _make_market_prices("2026-07-20T22:00:00.000Z")
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day2_prices)
+    await coordinator._refresh_tomorrow_cache(day1, day2, now_utc_1)
+    coordinator._adjust_update_interval(now_utc_1)
+
+    assert coordinator.cached_prices_tomorrow is day2_prices
+    assert coordinator.update_interval is None  # validated cache, safe to go idle
+
+    # --- Midnight Day 1 -> Day 2 ---
+    freezer.move_to(datetime(2026, 7, 21, 0, 0, tzinfo=tz))
+    coordinator.promote_tomorrow_prices()
+    assert coordinator.cached_prices_tomorrow is None
+
+    # --- Day 2, 13:00: first attempt is poisoned (echoes today's date) ---
+    freezer.move_to(datetime(2026, 7, 21, 13, 0, tzinfo=tz))
+    now_utc_2_first = dt_util.utcnow()
+
+    poisoned_response = _make_market_prices("2026-07-21T10:00:00.000Z")  # today, not tomorrow
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=poisoned_response)
+
+    result_first_attempt = await coordinator._refresh_tomorrow_cache(
+        day2, day3, now_utc_2_first
+    )
+    coordinator._adjust_update_interval(now_utc_2_first)
+
+    assert result_first_attempt is None
+    assert coordinator.cached_prices_tomorrow is None
+    assert coordinator.last_fetch_tomorrow is None
+    # Must not go idle — the retry needs the polling loop to still be running.
+    assert coordinator.update_interval == timedelta(minutes=5)
+
+    # --- Day 2, 13:05: retry gets the real data ---
+    freezer.move_to(datetime(2026, 7, 21, 13, 5, tzinfo=tz))
+    now_utc_2_retry = dt_util.utcnow()
+
+    day3_prices = _make_market_prices("2026-07-21T22:00:00.000Z")
+    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day3_prices)
+
+    result_retry = await coordinator._refresh_tomorrow_cache(
+        day2, day3, now_utc_2_retry
+    )
+    coordinator._adjust_update_interval(now_utc_2_retry)
+
+    assert result_retry is day3_prices
+    assert coordinator.cached_prices_tomorrow is day3_prices
+    assert coordinator.last_fetch_tomorrow == now_utc_2_retry
+    assert coordinator.update_interval is None  # now validated, safe to go idle
 
 
 @pytest.mark.asyncio
