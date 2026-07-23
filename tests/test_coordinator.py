@@ -1645,79 +1645,106 @@ async def test_promote_tomorrow_prices_rejects_stale_multi_day_old_cache(
 async def test_full_day_cycle_fetch_promote_refetch(
     mock_frank_energie, mock_config_entry, freezer
 ) -> None:
-    """Simulate a full day/night cycle end-to-end, not just isolated unit steps.
+    """Simulate three real days end-to-end through the actual production entry point.
 
-    Day 1, 13:00: fetch tomorrow's (Day 2) prices via _refresh_tomorrow_cache.
-    Midnight Day 1 -> Day 2: promote_tomorrow_prices() hands that cache over
-    to become "today".
-    Day 2, 13:00: _refresh_tomorrow_cache runs again to fetch Day 3.
+    FrankEnergiePriceCoordinator fully overrides _async_update_data (it does
+    NOT use the base class's _refresh_today_cache/_fetch_today_data at all —
+    those are dead code in production, since every real coordinator subclass
+    replaces _async_update_data). So driving _refresh_tomorrow_cache directly,
+    as the previous version of this test did, exercised real logic but not
+    the real entry point or the real "today" fetch path
+    (_fetch_prices_with_fallback + _carry_forward_previous_day).
 
-    This ties together three things that only interact across the day
-    boundary: the freshly-fetched-data validation in _refresh_tomorrow_cache,
-    the fact that promote_tomorrow_prices deliberately does not touch
-    last_fetch_tomorrow, and _refresh_tomorrow_cache's separate
-    last_fetch_tomorrow.date() != today staleness check that has to clean
-    that up again the next day. Each has its own unit test, but nothing
-    previously exercised them chained together with real dated data.
+    This drives the actual await coordinator._async_update_data() HA calls,
+    for Day 1 -> Day 2 -> Day 3 -> (into Day 4), with a midnight
+    promote_tomorrow_prices() between each pair — matching production, where
+    that call comes from __init__.py's independent midnight scheduler, not
+    from _async_update_data itself. Each day also does a second call 5
+    minutes later, mirroring the real 5-minute in-window polling, to confirm
+    the second call is a genuine no-op (matches the observed real-world log:
+    fetch completes one cycle, "update interval changed to None" appears
+    only on the next).
     """
     from datetime import date
 
     tz = ZoneInfo(TIMEZONE_AMSTERDAM)
-    day1, day2, day3 = date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22)
+    day1, day2, day3, day4 = (
+        date(2026, 7, 20),
+        date(2026, 7, 21),
+        date(2026, 7, 22),
+        date(2026, 7, 23),
+    )
 
     settings_coordinator = FrankEnergieSettingsCoordinator(
         MagicMock(), mock_config_entry, mock_frank_energie
     )
+    settings_coordinator.data = {}
+
     coordinator = FrankEnergiePriceCoordinator(
         MagicMock(), mock_config_entry, mock_frank_energie, settings_coordinator
     )
+    coordinator._fetch_contract_price_resolution_state = AsyncMock(return_value=None)
+    coordinator.store.async_save = AsyncMock()
 
-    # --- Day 1, 13:00 local: fetch tomorrow's (Day 2) prices ---
-    freezer.move_to(datetime(2026, 7, 20, 13, 0, tzinfo=tz))
-    now_utc_1 = dt_util.utcnow()
-
-    day1_today_prices = _make_market_prices("2026-07-20T10:00:00.000Z")
-    coordinator._static_prices_today = day1_today_prices
-    coordinator.cached_prices = {
-        DATA_ELECTRICITY: day1_today_prices.electricity,
-        DATA_GAS: day1_today_prices.gas,
+    # "Today" fetches, keyed by the local date being fetched as of.
+    today_fetches = {
+        day1: _make_market_prices("2026-07-20T10:00:00.000Z"),
+        day2: _make_market_prices("2026-07-21T10:00:00.000Z"),
+        day3: _make_market_prices("2026-07-22T10:00:00.000Z"),
+    }
+    # "Tomorrow" fetches, keyed by the tomorrow date being fetched.
+    tomorrow_fetches = {
+        day2: _make_market_prices("2026-07-20T22:00:00.000Z"),
+        day3: _make_market_prices("2026-07-21T22:00:00.000Z"),
+        day4: _make_market_prices("2026-07-22T22:00:00.000Z"),
     }
 
-    day2_prices = _make_market_prices("2026-07-20T22:00:00.000Z")  # Day 2, 00:00 local
-    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day2_prices)
+    async def fake_fetch_prices_with_fallback(start_date, end_date, use_fallback=True):
+        return today_fetches[start_date]
 
-    result_1300_day1 = await coordinator._refresh_tomorrow_cache(day1, day2, now_utc_1)
+    async def fake_fetch_tomorrow_data(tomorrow):
+        return tomorrow_fetches[tomorrow]
 
-    assert result_1300_day1 is day2_prices
-    assert coordinator.cached_prices_tomorrow is day2_prices
-    assert coordinator.last_fetch_tomorrow == now_utc_1
+    coordinator._fetch_prices_with_fallback = AsyncMock(
+        side_effect=fake_fetch_prices_with_fallback
+    )
+    coordinator._fetch_tomorrow_data = AsyncMock(side_effect=fake_fetch_tomorrow_data)
 
-    # --- Midnight Day 1 -> Day 2: promote tomorrow's cache to today ---
-    freezer.move_to(datetime(2026, 7, 21, 0, 0, tzinfo=tz))
-    coordinator.promote_tomorrow_prices()
+    for today, tomorrow in ((day1, day2), (day2, day3), (day3, day4)):
+        # --- {today}, 13:00 local: the real update cycle fetches tomorrow ---
+        freezer.move_to(datetime(today.year, today.month, today.day, 13, 0, tzinfo=tz))
+        now_utc_first = dt_util.utcnow()
 
-    # Day 2's prices are now "today"; nothing was ever fetched for Day 3 yet,
-    # so the tomorrow cache is empty rather than carrying leftover data.
-    assert coordinator.cached_prices_tomorrow is None
-    assert coordinator._static_prices_today.electricity.all[-1].date_from.astimezone(
-        tz
-    ).date() == day2
-    # promote_tomorrow_prices deliberately never touches last_fetch_tomorrow —
-    # it's still Day 1's fetch timestamp, now stale for Day 2.
-    assert coordinator.last_fetch_tomorrow == now_utc_1
+        result = await coordinator._async_update_data()
 
-    # --- Day 2, 13:00 local: fetch tomorrow's (Day 3) prices ---
-    freezer.move_to(datetime(2026, 7, 21, 13, 0, tzinfo=tz))
-    now_utc_2 = dt_util.utcnow()
+        assert coordinator.cached_prices_tomorrow is tomorrow_fetches[tomorrow]
+        assert coordinator.last_fetch_tomorrow == now_utc_first
+        assert (
+            result[DATA_ELECTRICITY].all[-1].date_from.astimezone(tz).date()
+            == tomorrow
+        )
+        fetch_calls_after_first = coordinator._fetch_tomorrow_data.call_count
 
-    day3_prices = _make_market_prices("2026-07-21T22:00:00.000Z")  # Day 3, 00:00 local
-    coordinator._fetch_tomorrow_data = AsyncMock(return_value=day3_prices)
+        # --- {today}, 13:05 local: next in-window tick must be a pure no-op ---
+        freezer.move_to(datetime(today.year, today.month, today.day, 13, 5, tzinfo=tz))
+        await coordinator._async_update_data()
 
-    result_1300_day2 = await coordinator._refresh_tomorrow_cache(day2, day3, now_utc_2)
+        assert coordinator._fetch_tomorrow_data.call_count == fetch_calls_after_first
+        assert coordinator.update_interval is None  # now confirmed idle
 
-    assert result_1300_day2 is day3_prices
-    assert coordinator.cached_prices_tomorrow is day3_prices
-    assert coordinator.last_fetch_tomorrow == now_utc_2
+        # --- Midnight {today} -> {tomorrow}: promote tomorrow's cache ---
+        freezer.move_to(
+            datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, tzinfo=tz)
+        )
+        coordinator.promote_tomorrow_prices()
+
+        assert coordinator.cached_prices_tomorrow is None
+        assert coordinator._static_prices_today.electricity.all[
+            -1
+        ].date_from.astimezone(tz).date() == tomorrow
+        # promote_tomorrow_prices deliberately never touches last_fetch_tomorrow —
+        # it's still stale for the new today until the next _async_update_data run.
+        assert coordinator.last_fetch_tomorrow == now_utc_first
 
 
 @pytest.mark.asyncio

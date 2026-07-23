@@ -177,9 +177,10 @@ class FrankEnergieComponent:  # pylint: disable=too-few-public-methods
             # listener's registration (the last step of a slow startup) loses
             # the race against the exact 13:00:00 boundary, that tick is
             # gone for good and nothing else was scheduled to try again until
-            # the next day. _refresh_today_cache/_refresh_tomorrow_cache
-            # already short-circuit to a no-op once genuinely up to date, so
-            # the extra calls on ticks where nothing changed cost nothing.
+            # the next day. FrankEnergiePriceCoordinator's _async_update_data
+            # already short-circuits both today's and tomorrow's fetch to a
+            # no-op once genuinely up to date, so the extra calls on ticks
+            # where nothing changed cost nothing.
             if time(TOMORROW_PUBLICATION_HOUR_LOCAL, 0) <= now_local.time() < time(15, 0):
                 # Debug, not info: this now fires up to 8x/day, and
                 # _refresh_tomorrow_cache already logs its own outcome
