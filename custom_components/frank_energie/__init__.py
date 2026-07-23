@@ -5,7 +5,7 @@
 import logging
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
@@ -30,6 +30,7 @@ from .const import (
     SERVICE_NAME_BATTERY_SESSIONS,
     SERVICE_NAME_ENODE_CHARGERS,
     TIMEZONE_AMSTERDAM,
+    TOMORROW_PUBLICATION_HOUR_LOCAL,
 )
 from .coordinator import (
     FrankEnergieCoordinator,
@@ -170,9 +171,22 @@ class FrankEnergieComponent:  # pylint: disable=too-few-public-methods
                 )
                 price_coordinator.promote_tomorrow_prices()
 
-            # Check for 13:00 local TIMEZONE_AMSTERDAM transition to fetch tomorrow's prices
-            if now_local.hour == 13 and now_local.minute == 0:
-                _LOGGER.info("13:00 local time: explicitly triggering price fetch")
+            # Every aligned tick across the price release window explicitly
+            # triggers a refresh, not just the exact 13:00 one. A single
+            # exact-tick trigger is a single point of failure: if this
+            # listener's registration (the last step of a slow startup) loses
+            # the race against the exact 13:00:00 boundary, that tick is
+            # gone for good and nothing else was scheduled to try again until
+            # the next day. _refresh_today_cache/_refresh_tomorrow_cache
+            # already short-circuit to a no-op once genuinely up to date, so
+            # the extra calls on ticks where nothing changed cost nothing.
+            if time(TOMORROW_PUBLICATION_HOUR_LOCAL, 0) <= now_local.time() < time(15, 0):
+                # Debug, not info: this now fires up to 8x/day, and
+                # _refresh_tomorrow_cache already logs its own outcome
+                # (fetched vs. already cached, skip) at the appropriate level.
+                _LOGGER.debug(
+                    "Price release window local time: explicitly triggering price fetch"
+                )
                 await price_coordinator.async_request_refresh()
             else:
                 # Trigger sensor state updates using cached data

@@ -7,7 +7,12 @@ import zoneinfo
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntryState
-from custom_components.frank_energie.const import DOMAIN, CONF_COORDINATOR
+from custom_components.frank_energie import FrankEnergieComponent
+from custom_components.frank_energie.const import (
+    DOMAIN,
+    CONF_COORDINATOR,
+    TIMEZONE_AMSTERDAM,
+)
 from custom_components.frank_energie.helpers import encrypt_password
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from tests.utils import ResponseMocks
@@ -171,6 +176,68 @@ async def test_remove_entry_deletes_price_cache_store(
         assert remove_result["require_restart"] is False
         mock_store_cls.assert_called_once_with(hass, 1, f"{DOMAIN}_prices_{entry.entry_id}")
         mock_store.async_remove.assert_awaited_once()
+
+
+async def test_aligned_refresh_covers_whole_price_release_window(
+    hass: HomeAssistant,
+) -> None:
+    """The 13:00 trigger must not be a single exact-tick point of failure.
+
+    Regression test: only the exact hour==13, minute==0 tick used to call
+    async_request_refresh(); every other quarter-hour tick in the window
+    just re-broadcast cached data via async_update_listeners() without
+    fetching anything. If this listener's registration (the last step of
+    setup) lost the race against that one exact boundary — plausible on a
+    slow full HA restart competing with every other integration for the
+    event loop — nothing else was scheduled to try again until the next
+    day's 13:00. Now every tick across 13:00-15:00 local retries, so no
+    single tick is load-bearing.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data={}, entry_id="test_aligned")
+    entry.add_to_hass(hass)
+    component = FrankEnergieComponent(hass, entry)
+
+    price_coordinator = MagicMock()
+    price_coordinator.async_request_refresh = AsyncMock()
+    price_coordinator.async_update_listeners = MagicMock()
+    price_coordinator.resolution = "PT60M"
+
+    captured_callback = None
+
+    def fake_track_utc_time_change(hass_arg, action, **kwargs):
+        nonlocal captured_callback
+        captured_callback = action
+        return MagicMock()
+
+    with patch(
+        "custom_components.frank_energie.async_track_utc_time_change",
+        side_effect=fake_track_utc_time_change,
+    ):
+        await component._schedule_aligned_updates(price_coordinator)
+
+    assert captured_callback is not None
+
+    tz = zoneinfo.ZoneInfo(TIMEZONE_AMSTERDAM)
+
+    for hour, minute in [(13, 0), (13, 15), (13, 45), (14, 45)]:
+        price_coordinator.async_request_refresh.reset_mock()
+        with patch(
+            "homeassistant.util.dt.now",
+            return_value=datetime(2026, 7, 21, hour, minute, tzinfo=tz),
+        ):
+            await captured_callback(datetime.now(tz))
+        price_coordinator.async_request_refresh.assert_awaited_once()
+
+    # Outside the window: no refresh, just a listener update.
+    price_coordinator.async_request_refresh.reset_mock()
+    price_coordinator.async_update_listeners.reset_mock()
+    with patch(
+        "homeassistant.util.dt.now",
+        return_value=datetime(2026, 7, 21, 15, 0, tzinfo=tz),
+    ):
+        await captured_callback(datetime.now(tz))
+    price_coordinator.async_request_refresh.assert_not_called()
+    price_coordinator.async_update_listeners.assert_called_once()
 
 
 async def test_encryption_decryption(hass: HomeAssistant) -> None:
