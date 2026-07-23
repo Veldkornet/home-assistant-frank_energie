@@ -417,13 +417,6 @@ class FrankEnergieComponent:  # pylint: disable=too-few-public-methods
         _LOGGER.debug("Generated title: %s for site reference: %s", title, reference)
         return reference, title
 
-    def _create_frank_energie_coordinator(
-        self, api: FrankEnergie
-    ) -> FrankEnergieCoordinator:
-        """Create the Frank Energie Coordinator instance."""
-        _LOGGER.debug("Creating Frank Energie Coordinator instance")
-        return FrankEnergieCoordinator(self.hass, self.entry, api)
-
     async def _async_forward_entry_setups(self) -> None:
         """Forward entry setups to appropriate platforms.
 
