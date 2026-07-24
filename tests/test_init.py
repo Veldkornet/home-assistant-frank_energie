@@ -14,6 +14,9 @@ from custom_components.frank_energie.const import (
     TIMEZONE_AMSTERDAM,
 )
 from custom_components.frank_energie.helpers import encrypt_password
+from custom_components.frank_energie.helpers import (
+    _get_fernet_key as real_get_fernet_key,
+)
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from tests.utils import ResponseMocks
 
@@ -261,6 +264,45 @@ async def test_encryption_decryption(hass: HomeAssistant) -> None:
     # Test plaintext fallback
     assert decrypt_password(hass, "my_plain_password") == "my_plain_password"
     assert decrypt_password(hass, "") == ""
+
+
+async def test_decrypt_password_returns_none_on_corrupted_ciphertext(
+    hass: HomeAssistant,
+) -> None:
+    """A gAAAA-prefixed string that fails to decrypt (wrong/rotated key,
+    corruption) must return None with a warning, not raise.
+
+    Realistic scenario: core.uuid changes, or a password encrypted on one
+    HA instance gets restored via backup onto another.
+    """
+    from custom_components.frank_energie.helpers import decrypt_password
+
+    hass.data["core.uuid"] = "test_uuid_123"
+
+    # Looks like a Fernet token (gAAAA prefix) but isn't valid ciphertext.
+    corrupted = "gAAAAABnot-a-real-fernet-token" + "x" * 20
+
+    assert decrypt_password(hass, corrupted) is None
+
+
+async def test_get_fernet_key_raises_when_core_uuid_missing(
+    hass: HomeAssistant,
+) -> None:
+    """_get_fernet_key must raise EncryptionError when core.uuid is unavailable,
+    rather than silently deriving a key from a missing/None value.
+
+    Tests the real implementation directly (captured at import time, before
+    the autouse mock_core_uuid fixture in conftest.py patches this same name
+    for every other test) — that fixture exists specifically so hass-based
+    tests don't need a real core.uuid, which means it also hides this
+    function's own error path from every test that goes through the mock.
+    """
+    from custom_components.frank_energie.exceptions import EncryptionError
+
+    hass.data.pop("core.uuid", None)
+
+    with pytest.raises(EncryptionError):
+        real_get_fernet_key(hass)
 
 
 @pytest.mark.skip(reason="Lingering timer false positive during mock teardown")
