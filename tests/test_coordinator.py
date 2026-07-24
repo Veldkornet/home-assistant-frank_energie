@@ -797,6 +797,70 @@ async def test_fetch_prices_with_fallback_unauthenticated_tomorrow_not_published
 
 
 @pytest.mark.asyncio
+async def test_fetch_prices_with_fallback_authenticated_tomorrow_not_published(
+    coordinator: FrankEnergieCoordinator, mock_frank_energie: AsyncMock
+) -> None:
+    """Authenticated tomorrow-fetch must not fall back to cached today prices either.
+
+    The unauthenticated guard (see the test above) explicitly returns before
+    ever substituting _cached_prices for a missing public-prices response.
+    For authenticated users that guard doesn't apply — is_authenticated=True
+    means public_prices *does* get substituted with _cached_prices — but that
+    substituted value is never actually returned for a tomorrow-fetch: every
+    reachable return path in this branch is driven by user_prices (None here,
+    so returns None), not public_prices. This proves that by code path, not
+    just inspection.
+    """
+    from datetime import date
+
+    mock_frank_energie.is_authenticated = True
+
+    today_prices = MagicMock()
+    coordinator._cached_prices = today_prices
+
+    coordinator._fetch_public_prices_for_range = AsyncMock(return_value=None)
+    coordinator._fetch_user_prices_for_range = AsyncMock(return_value=None)
+
+    result = await coordinator._fetch_prices_with_fallback(
+        date(2026, 7, 20), date(2026, 7, 21), use_fallback=False
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_prices_with_fallback_authenticated_tomorrow_incomplete_user_prices_not_merged_with_public(
+    coordinator: FrankEnergieCoordinator, mock_frank_energie: AsyncMock
+) -> None:
+    """Incomplete authenticated tomorrow prices must be returned as-is, not
+    merged with (potentially poisoned) public prices — same "no fallback for
+    tomorrow" rule that applies when user_prices is missing entirely.
+    """
+    from datetime import date
+
+    mock_frank_energie.is_authenticated = True
+
+    public_prices = MagicMock()
+    coordinator._fetch_public_prices_for_range = AsyncMock(return_value=public_prices)
+
+    # Electricity present, gas missing — incomplete, but real customer data.
+    incomplete_user_prices = MagicMock()
+    incomplete_user_prices.electricity.all = [MagicMock()]
+    incomplete_user_prices.gas = None
+    coordinator._fetch_user_prices_for_range = AsyncMock(
+        return_value=incomplete_user_prices
+    )
+
+    result = await coordinator._fetch_prices_with_fallback(
+        date(2026, 7, 20), date(2026, 7, 21), use_fallback=False
+    )
+
+    assert result is incomplete_user_prices
+    # Must not have been merged with the concurrently-fetched public prices.
+    assert result.gas is None
+
+
+@pytest.mark.asyncio
 async def test_fetch_prices_with_fallback_unauthenticated_today_uses_cache(
     coordinator: FrankEnergieCoordinator, mock_frank_energie: AsyncMock
 ) -> None:
